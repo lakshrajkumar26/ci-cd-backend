@@ -2,7 +2,8 @@ name: Build & Deploy Backend to Hostinger VPS
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -10,60 +11,77 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (for CI)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'      # change if you use different major version
 
-      - name: Install dependencies (CI)
-        run: npm ci
-
-      - name: Run tests (if present)
+      - name: Install build deps (local, optional)
         run: |
-          if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
-            echo "Running tests..."
-            npm test || true
-          else
-            echo "No test script found, skipping tests."
-          fi
+          # If you need to build frontend or compile something add steps here.
+          echo "No local build required for plain backend (skip)."
 
-      - name: Start ssh-agent and add key
-        uses: webfactory/ssh-agent@v0.7.0
+      - name: Start ssh-agent and add private key
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Ensure VPS known host
+      - name: Add VPS to known_hosts
         run: |
-          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts || true
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.VPS_PORT }}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts || true
 
-      - name: Rsync backend to VPS (exclude node_modules & .git)
+      - name: Create remote dir (if missing) and rsync files
         run: |
-          echo "Creating remote dir if missing..."
-          ssh -p ${{ secrets.VPS_PORT }} ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} "mkdir -p ${{ secrets.REMOTE_DIR }}"
-          echo "Rsyncing files to remote..."
-          rsync -avz --delete --exclude node_modules --exclude .git -e "ssh -p ${{ secrets.VPS_PORT }}" ./ ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.REMOTE_DIR }}/
+          echo "Ensure remote dir exists: $REMOTE_DIR"
+          ssh -o StrictHostKeyChecking=no -p "${{ secrets.VPS_PORT }}" "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}" "mkdir -p '$REMOTE_DIR' && chmod 755 '$REMOTE_DIR'"
 
-      - name: Install production deps on VPS & restart service
-        env:
-          REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
+          echo "Rsyncing files to remote ($REMOTE_DIR)..."
+          # Note: exclude node_modules and other local-only files
+          rsync -avz --delete --exclude 'node_modules' --exclude '.git' -e "ssh -p ${{ secrets.VPS_PORT }}" ./ "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}":"${REMOTE_DIR}"
+
+      - name: Install production dependencies & restart service on VPS
+        id: deploy
         run: |
-          ssh -o StrictHostKeyChecking=no -p ${{ secrets.VPS_PORT }} ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
-            set -e
-            cd "${REMOTE_DIR}"
-            echo "Installing production dependencies..."
-            npm ci --only=production || true
-            echo "Restarting systemd service: ci-cd-backend"
-            # use sudo if needed; if user is root this is harmless
-            sudo systemctl restart ci-cd-backend || { echo "Failed to restart service"; journalctl -u ci-cd-backend -n 50 --no-pager; exit 1; }
+          ssh -o StrictHostKeyChecking=no -p "${{ secrets.VPS_PORT }}" "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}" bash -s <<'EOF'
+            set -euo pipefail
+            cd "$REMOTE_DIR" || (echo "REMOTE_DIR not found: $REMOTE_DIR" && exit 1)
+
+            echo "Node version on remote: $(node -v || echo 'node not found')"
+            echo "NPM version on remote: $(npm -v || echo 'npm not found')"
+
+            # Install dependencies: prefer npm ci if lockfile present, otherwise npm install --production
+            if [ -f package-lock.json ]; then
+              echo "package-lock.json found — running npm ci --omit=dev"
+              npm ci --omit=dev || { echo "npm ci failed, falling back to npm install --production"; npm install --production; }
+            else
+              echo "No package-lock.json — running npm install --production"
+              npm install --production
+            fi
+
+            # Reset any previous failed state and restart the service
+            echo "Resetting failed systemd state (if any) and restarting service..."
+            sudo systemctl reset-failed ci-cd-backend || true
+            sudo systemctl daemon-reload || true
+            sudo systemctl restart ci-cd-backend
+
             echo "--- service status ---"
-            sudo systemctl status ci-cd-backend --no-pager || true
-            echo "--- last 50 log lines ---"
-            sudo journalctl -u ci-cd-backend -n 50 --no-pager || true
+            sudo systemctl status ci-cd-backend --no-pager
+
+            echo "--- last 100 journal lines for service ---"
+            sudo journalctl -u ci-cd-backend -n 100 --no-pager || true
+
             echo "--- files in remote dir ---"
-            ls -la "${REMOTE_DIR}"
+            ls -la "$REMOTE_DIR" || true
+
           EOF
+
+      - name: Show deploy step output
+        run: echo "Deploy step finished"
