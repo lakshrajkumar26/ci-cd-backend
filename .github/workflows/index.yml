@@ -18,62 +18,65 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js (runner tool)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'      # change if you use different major version
-
-      - name: Install build deps (local, optional)
-        run: |
-          # If you need to build frontend or compile something add steps here.
-          echo "No local build required for plain backend (skip)."
+          node-version: '20' # change if you need different version
 
       - name: Start ssh-agent and add private key
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Add VPS to known_hosts
+      - name: Add VPS host key to known_hosts
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -p "${{ secrets.VPS_PORT }}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts || true
 
-      - name: Create remote dir (if missing) and rsync files
+      - name: Ensure remote dir exists and rsync files
         run: |
-          echo "Ensure remote dir exists: $REMOTE_DIR"
-          ssh -o StrictHostKeyChecking=no -p "${{ secrets.VPS_PORT }}" "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}" "mkdir -p '$REMOTE_DIR' && chmod 755 '$REMOTE_DIR'"
+          echo "Ensure remote dir exists: ${REMOTE_DIR}"
+          ssh -o StrictHostKeyChecking=no -p "${{ secrets.VPS_PORT }}" "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}" "mkdir -p '${REMOTE_DIR}' && chmod 755 '${REMOTE_DIR}'"
 
           echo "Rsyncing files to remote ($REMOTE_DIR)..."
-          # Note: exclude node_modules and other local-only files
-          rsync -avz --delete --exclude 'node_modules' --exclude '.git' -e "ssh -p ${{ secrets.VPS_PORT }}" ./ "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}":"${REMOTE_DIR}"
+          rsync -avz --delete --exclude 'node_modules' --exclude '.git' --exclude '.github' -e "ssh -p ${{ secrets.VPS_PORT }}" ./ "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}":"${REMOTE_DIR}"
 
-      - name: Install production dependencies & restart service on VPS
+      - name: Install production deps on VPS & restart service (safe)
         id: deploy
         run: |
-          ssh -o StrictHostKeyChecking=no -p "${{ secrets.VPS_PORT }}" "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}" bash -s <<'EOF'
+          # Pass REMOTE_DIR as positional arg to avoid unbound var in remote shell
+          ssh -o StrictHostKeyChecking=no -p "${{ secrets.VPS_PORT }}" "${{ secrets.VPS_USER }}"@"${{ secrets.VPS_HOST }}" bash -s -- "${REMOTE_DIR:?}" <<'EOF'
             set -euo pipefail
+
+            REMOTE_DIR="$1"
+            echo "Using REMOTE_DIR: $REMOTE_DIR"
+
             cd "$REMOTE_DIR" || (echo "REMOTE_DIR not found: $REMOTE_DIR" && exit 1)
 
             echo "Node version on remote: $(node -v || echo 'node not found')"
             echo "NPM version on remote: $(npm -v || echo 'npm not found')"
 
-            # Install dependencies: prefer npm ci if lockfile present, otherwise npm install --production
+            # Install dependencies: prefer npm ci when lockfile present, otherwise npm install --production
             if [ -f package-lock.json ]; then
               echo "package-lock.json found — running npm ci --omit=dev"
-              npm ci --omit=dev || { echo "npm ci failed, falling back to npm install --production"; npm install --production; }
+              if npm ci --omit=dev; then
+                echo "npm ci succeeded"
+              else
+                echo "npm ci failed — falling back to npm install --production"
+                npm install --production
+              fi
             else
               echo "No package-lock.json — running npm install --production"
               npm install --production
             fi
 
-            # Reset any previous failed state and restart the service
             echo "Resetting failed systemd state (if any) and restarting service..."
             sudo systemctl reset-failed ci-cd-backend || true
             sudo systemctl daemon-reload || true
-            sudo systemctl restart ci-cd-backend
+            sudo systemctl restart ci-cd-backend || { echo 'systemctl restart failed'; sudo journalctl -u ci-cd-backend -n 100 --no-pager; exit 1; }
 
             echo "--- service status ---"
-            sudo systemctl status ci-cd-backend --no-pager
+            sudo systemctl status ci-cd-backend --no-pager || true
 
             echo "--- last 100 journal lines for service ---"
             sudo journalctl -u ci-cd-backend -n 100 --no-pager || true
@@ -83,5 +86,5 @@ jobs:
 
           EOF
 
-      - name: Show deploy step output
-        run: echo "Deploy step finished"
+      - name: Deployment finished
+        run: echo "Deploy finished (check logs above)."
