@@ -27,5 +27,11 @@ app.get("/", (req, res) => {
 app.get("/laksh", (req, res) => {
   res.send("Backend Running ✔ laksh");
 });
+
+
+
+app.get("/ojas", (req, res) => {
+  res.send("Backend Running ✔ 3rd ci cd");
+});
 const PORT = 5012;
 app.listen(PORT, () => console.log("🚀 Server running on port", PORT));
