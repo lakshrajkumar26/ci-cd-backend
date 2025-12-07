@@ -38,7 +38,7 @@ pipeline {
           sh """
             ${SCANNER_HOME}/bin/sonar-scanner \
               -Dsonar.projectKey=node-backend \
-              -Dsonar.sources=src
+              -Dsonar.sources=./
           """
         }
       }
